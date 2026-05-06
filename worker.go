@@ -19,10 +19,12 @@ import (
 
 // Source names for inbox items.
 const (
-	sourceUser      = "user"
-	sourceTrigger   = "trigger"
-	sourceHeartbeat = "heartbeat"
-	sourceCompact   = "compact"
+	sourceUser       = "user"
+	sourceTrigger    = "trigger"
+	sourceHeartbeat  = "heartbeat"
+	sourceCompact    = "compact"
+	sourceListModels = "list-models"
+	sourceSetModel   = "set-model"
 )
 
 // Worker owns the single pi process and drains the inbox in priority order.
@@ -39,14 +41,17 @@ type Worker struct {
 	hbPrompt      string
 	triggerPrompt string
 
-	// mu protects pi, lastUse, compactResult, currentPriority, currentCancel, freshStart.
-	mu              sync.Mutex
-	pi              *PiProcess
-	freshStart      bool // next ensurePi spawns without --continue
-	lastUse         time.Time
-	currentPriority int64
-	currentCancel   context.CancelFunc
-	compactResult   chan compactOutcome
+	// mu protects pi, lastUse, compactResult, listModelsResult,
+	// setModelResult, currentPriority, currentCancel, freshStart.
+	mu               sync.Mutex
+	pi               *PiProcess
+	freshStart       bool // next ensurePi spawns without --continue
+	lastUse          time.Time
+	currentPriority  int64
+	currentCancel    context.CancelFunc
+	compactResult    chan compactOutcome
+	listModelsResult chan listModelsOutcome
+	setModelResult   chan setModelOutcome
 
 	// wake is signalled (non-blocking) on every Notify call so the
 	// worker can poll the DB for the highest-priority item.
@@ -59,11 +64,31 @@ type compactOutcome struct {
 	err    error
 }
 
+// listModelsOutcome carries the result of a list-models operation.
+type listModelsOutcome struct {
+	models []ModelInfo
+	err    error
+}
+
+// setModelOutcome carries the result of a set-model operation.
+type setModelOutcome struct {
+	model *ModelInfo
+	err   error
+}
+
 // Backend is the subset of backend.Backend the worker needs.
 type Backend interface {
 	SetTyping(ctx context.Context, conversationID string, typing bool)
 	SendMessage(ctx context.Context, conversationID string, text string, replyToID string) string
 	MarkdownFlavor() backend.MarkdownFlavor
+}
+
+// modelsBroadcaster is satisfied by backends that can push the current
+// model list to connected clients. The worker uses it to notify
+// dropdowns when a fresh pi spawns; backends that don't have a model
+// UI (matrix, nostr, signal) simply don't implement it.
+type modelsBroadcaster interface {
+	BroadcastModels(ctx context.Context)
 }
 
 // NewWorker creates a new worker. The pi process is started lazily on first dequeue.
@@ -193,6 +218,71 @@ func (w *Worker) Compact(ctx context.Context) (*CompactResult, error) {
 		return nil, fmt.Errorf("compact cancelled: %w", ctx.Err())
 	case outcome := <-ch:
 		return outcome.result, outcome.err
+	}
+}
+
+// ListModels returns the models available in pi's model registry.
+// Blocks until the worker processes the request.
+func (w *Worker) ListModels(ctx context.Context) ([]ModelInfo, error) {
+	w.mu.Lock()
+	if w.listModelsResult != nil {
+		w.mu.Unlock()
+
+		return nil, errors.New("list-models already in progress")
+	}
+
+	ch := make(chan listModelsOutcome, 1)
+	w.listModelsResult = ch
+	w.mu.Unlock()
+
+	if err := w.inbox.Enqueue(ctx, PriorityUser, sourceListModels, "", ""); err != nil {
+		w.mu.Lock()
+		w.listModelsResult = nil
+		w.mu.Unlock()
+
+		return nil, fmt.Errorf("enqueuing list-models: %w", err)
+	}
+
+	w.Notify(PriorityUser)
+
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("list-models cancelled: %w", ctx.Err())
+	case outcome := <-ch:
+		return outcome.models, outcome.err
+	}
+}
+
+// SetModel tells pi to switch to a different model.
+// Blocks until the worker processes the request.
+func (w *Worker) SetModel(ctx context.Context, provider, modelID string) (*ModelInfo, error) {
+	w.mu.Lock()
+	if w.setModelResult != nil {
+		w.mu.Unlock()
+
+		return nil, errors.New("set-model already in progress")
+	}
+
+	ch := make(chan setModelOutcome, 1)
+	w.setModelResult = ch
+	w.mu.Unlock()
+
+	// Encode provider/modelID in the inbox row's content/replyTo columns.
+	if err := w.inbox.Enqueue(ctx, PriorityUser, sourceSetModel, provider, modelID); err != nil {
+		w.mu.Lock()
+		w.setModelResult = nil
+		w.mu.Unlock()
+
+		return nil, fmt.Errorf("enqueuing set-model: %w", err)
+	}
+
+	w.Notify(PriorityUser)
+
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("set-model cancelled: %w", ctx.Err())
+	case outcome := <-ch:
+		return outcome.model, outcome.err
 	}
 }
 
@@ -328,13 +418,22 @@ func (w *Worker) processItem(ctx context.Context, item Inbox) bool {
 		w.mu.Unlock()
 	}()
 
-	if item.Source == sourceCompact {
+	switch item.Source {
+	case sourceCompact:
 		w.processCompact(itemCtx)
 
 		return false
-	}
+	case sourceListModels:
+		w.processListModels(itemCtx)
 
-	return w.processPrompt(itemCtx, item)
+		return false
+	case sourceSetModel:
+		w.processSetModel(itemCtx, item.Content, item.ReplyTo)
+
+		return false
+	default:
+		return w.processPrompt(itemCtx, item)
+	}
 }
 
 // processPrompt handles a user/trigger/heartbeat item. Returns true if
@@ -491,6 +590,56 @@ func (w *Worker) processCompact(ctx context.Context) {
 	ch <- compactOutcome{result: result, err: err}
 }
 
+func (w *Worker) processListModels(ctx context.Context) {
+	w.mu.Lock()
+	ch := w.listModelsResult
+	w.listModelsResult = nil
+	w.mu.Unlock()
+
+	if ch == nil {
+		slog.Warn("worker: list-models item but no result channel")
+
+		return
+	}
+
+	// Cold-spawn pi on first list-models. The GUI typically issues
+	// list-models before any chat traffic to populate its dropdown;
+	// erroring with "no active session" would leave it stuck on
+	// "unknown model" until the user sent a prompt.
+	pi, err := w.ensurePi(ctx)
+	if err != nil {
+		ch <- listModelsOutcome{err: err}
+
+		return
+	}
+
+	models, err := pi.ListModels(ctx)
+	ch <- listModelsOutcome{models: models, err: err}
+}
+
+func (w *Worker) processSetModel(ctx context.Context, provider, modelID string) {
+	w.mu.Lock()
+	ch := w.setModelResult
+	w.setModelResult = nil
+	w.mu.Unlock()
+
+	if ch == nil {
+		slog.Warn("worker: set-model item but no result channel")
+
+		return
+	}
+
+	pi, err := w.ensurePi(ctx)
+	if err != nil {
+		ch <- setModelOutcome{err: err}
+
+		return
+	}
+
+	model, err := pi.SetModel(ctx, provider, modelID)
+	ch <- setModelOutcome{model: model, err: err}
+}
+
 func wasPreempted(ctx context.Context, err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
 		ctx.Err() != nil
@@ -563,6 +712,15 @@ func (w *Worker) ensurePi(ctx context.Context) (*PiProcess, error) {
 	w.mu.Lock()
 	w.pi = pi
 	w.mu.Unlock()
+
+	// Push the current model list to connected clients so dropdowns
+	// populate on the first spawn instead of after the user happens to
+	// close and reopen the panel. Async — BroadcastModels enqueues a
+	// list-models task which the worker picks up after the item that
+	// triggered this ensurePi finishes processing.
+	if mb, ok := w.be.(modelsBroadcaster); ok {
+		go mb.BroadcastModels(context.Background()) //nolint:contextcheck,gosec // post-spawn notification outlives the item ctx
+	}
 
 	return pi, nil
 }

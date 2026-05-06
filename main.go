@@ -194,7 +194,7 @@ func wireServices(ctx context.Context, cfg *Config, db *sql.DB, inbox *InboxStor
 
 	var app *App
 
-	b, err := createBackend(ctx, cfg,
+	b, err := createBackend(ctx, cfg, worker,
 		func(ctx context.Context, msg backend.Message) { app.HandleMessage(ctx, msg) },
 		func(_ string) { worker.Restart() },
 	)
@@ -221,7 +221,7 @@ func wireServices(ctx context.Context, cfg *Config, db *sql.DB, inbox *InboxStor
 	return b, worker, nil
 }
 
-func createBackend(ctx context.Context, cfg *Config, handler backend.MessageHandler, onRoomCleanup func(string)) (backend.Backend, error) { //nolint:ireturn // factory returns interface by design
+func createBackend(ctx context.Context, cfg *Config, worker *Worker, handler backend.MessageHandler, onRoomCleanup func(string)) (backend.Backend, error) { //nolint:ireturn // factory returns interface by design
 	switch cfg.BackendType {
 	case backendMatrix:
 		return createMatrixBackend(cfg, handler, onRoomCleanup)
@@ -230,7 +230,7 @@ func createBackend(ctx context.Context, cfg *Config, handler backend.MessageHand
 	case backendSignal:
 		return createSignalBackend(cfg, handler)
 	case backendSocket:
-		return createSocketBackend(cfg, handler)
+		return createSocketBackend(cfg, handler, worker)
 	default:
 		return nil, fmt.Errorf("unsupported backend type: %q", cfg.BackendType)
 	}
@@ -311,11 +311,11 @@ func createNostrBackend(ctx context.Context, cfg *Config, handler backend.Messag
 	return b, nil
 }
 
-func createSocketBackend(cfg *Config, handler backend.MessageHandler) (*socketbackend.Backend, error) {
+func createSocketBackend(cfg *Config, handler backend.MessageHandler, models socketbackend.ModelService) (*socketbackend.Backend, error) {
 	b, err := socketbackend.New(socketbackend.Config{
 		SocketPath: cfg.Socket.SocketPath,
 		Name:       cfg.Socket.Name,
-	}, handler)
+	}, handler, models)
 	if err != nil {
 		return nil, fmt.Errorf("creating socket backend: %w", err)
 	}

@@ -27,6 +27,14 @@ func newTestDBAt(ctx context.Context, t *testing.T, path string) *sql.DB {
 		t.Fatal(err)
 	}
 
+	// modernc/sqlite gives each pool connection its own private
+	// `:memory:` DB unless cache=shared is set in the DSN. Without
+	// that, only the connection that ran the schema migration knows
+	// the tables exist; any query the pool routes to a second
+	// connection fails with "no such table". Pin the pool to one
+	// connection so test DBs behave like a single shared instance.
+	db.SetMaxOpenConns(1)
+
 	if _, err := db.ExecContext(ctx, dbSchema); err != nil {
 		db.Close()
 		t.Fatal(err)

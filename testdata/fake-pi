@@ -22,5 +22,21 @@ while IFS= read -r line; do
     *'"type":"compact"'*|*'"type": "compact"'*)
       printf '%s\n' '{"type":"response","command":"compact","success":true,"data":{"tokensBefore":1,"summary":"s"}}'
       ;;
+    *'"type":"get_available_models"'*|*'"type": "get_available_models"'*)
+      printf '%s\n' '{"type":"response","command":"get_available_models","success":true,"data":{"models":[{"provider":"local","id":"qwen3","contextWindow":32768,"reasoning":false},{"provider":"local","id":"gpt-oss","contextWindow":131072,"reasoning":true}]}}'
+      ;;
+    *'"type":"get_state"'*|*'"type": "get_state"'*)
+      # Mirror pi's session state shape. The Active flag in ListModels
+      # comes from cross-referencing this against get_available_models,
+      # so the first model in the list becomes "active" for tests.
+      printf '%s\n' '{"type":"response","command":"get_state","success":true,"data":{"model":{"provider":"local","id":"qwen3","contextWindow":32768,"reasoning":false},"thinkingLevel":"off","isStreaming":false,"isCompacting":false,"steeringMode":"all","followUpMode":"all","sessionId":"s","autoCompactionEnabled":false,"messageCount":0,"pendingMessageCount":0}}'
+      ;;
+    *'"type":"set_model"'*|*'"type": "set_model"'*)
+      # Echo back the requested provider/modelId. The test checks routing,
+      # not real registry validation.
+      provider=$(printf '%s' "$line" | sed -n 's/.*"provider":"\([^"]*\)".*/\1/p')
+      modelid=$(printf '%s' "$line" | sed -n 's/.*"modelId":"\([^"]*\)".*/\1/p')
+      printf '%s\n' "{\"type\":\"response\",\"command\":\"set_model\",\"success\":true,\"data\":{\"provider\":\"$provider\",\"id\":\"$modelid\",\"contextWindow\":32768,\"reasoning\":false}}"
+      ;;
   esac
 done
