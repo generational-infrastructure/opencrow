@@ -72,3 +72,17 @@ type Streamer interface {
 
 // MessageHandler is a callback invoked by the backend for each inbound user message.
 type MessageHandler func(ctx context.Context, msg Message)
+
+// ModelInfo describes a model available in the agent's model registry.
+//
+//nolint:tagliatelle // match pi protocol camelCase
+type ModelInfo struct {
+	Provider      string `json:"provider"`
+	ID            string `json:"id"`
+	ContextWindow int    `json:"contextWindow"`
+	Reasoning     bool   `json:"reasoning"`
+	// Active is true when this model is currently selected in the agent
+	// session. Populated by the worker by merging get_state into the
+	// get_available_models list; pi itself does not set this flag.
+	Active bool `json:"active"`
+}

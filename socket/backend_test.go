@@ -16,16 +16,25 @@ import (
 func TestNew_RequiresSocketPath(t *testing.T) {
 	t.Parallel()
 
-	_, err := New(Config{}, func(_ context.Context, _ backend.Message) {})
+	_, err := New(Config{}, func(_ context.Context, _ backend.Message) {}, &stubModelService{})
 	if err == nil {
 		t.Fatal("expected error for empty SocketPath")
+	}
+}
+
+func TestNew_RequiresModelService(t *testing.T) {
+	t.Parallel()
+
+	_, err := New(Config{SocketPath: "/tmp/test.sock"}, func(_ context.Context, _ backend.Message) {}, nil)
+	if err == nil {
+		t.Fatal("expected error for nil model service")
 	}
 }
 
 func TestNew_DefaultName(t *testing.T) {
 	t.Parallel()
 
-	b, err := New(Config{SocketPath: "/tmp/test.sock"}, func(_ context.Context, _ backend.Message) {})
+	b, err := New(Config{SocketPath: "/tmp/test.sock"}, func(_ context.Context, _ backend.Message) {}, &stubModelService{})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -37,12 +46,13 @@ func TestNew_DefaultName(t *testing.T) {
 
 // startBackend starts a socket backend in a goroutine, returning the
 // backend and a cleanup function. The socket is created in t.TempDir().
-func startBackend(t *testing.T, handler backend.MessageHandler) (*Backend, string, context.CancelFunc) {
+// Tests that don't exercise model commands can pass a zero stubModelService.
+func startBackend(t *testing.T, handler backend.MessageHandler, models ModelService) (*Backend, string, context.CancelFunc) {
 	t.Helper()
 
 	sockPath := filepath.Join(t.TempDir(), "test.sock")
 
-	b, err := New(Config{SocketPath: sockPath, Name: "TestBot"}, handler)
+	b, err := New(Config{SocketPath: sockPath, Name: "TestBot"}, handler, models)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -78,6 +88,32 @@ func dial(t *testing.T, sockPath string) net.Conn {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
+
+	return conn
+}
+
+// dialSynced dials and round-trips a replay command, ensuring the
+// server has fully registered the connection in b.conns before
+// returning. Use this when the test relies on broadcast push() reaching
+// the connection — without sync, Accept()→register can lose events to
+// the dial-then-broadcast race under parallel load.
+func dialSynced(t *testing.T, sockPath string) net.Conn {
+	t.Helper()
+
+	conn := dial(t, sockPath)
+
+	if _, err := conn.Write([]byte(`{"cmd":"replay"}` + "\n")); err != nil {
+		t.Fatalf("dialSynced: write replay: %v", err)
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+	var buf [1024]byte
+	if _, err := conn.Read(buf[:]); err != nil {
+		t.Fatalf("dialSynced: drain replay response: %v", err)
+	}
+
+	_ = conn.SetReadDeadline(time.Time{})
 
 	return conn
 }
@@ -134,7 +170,7 @@ func sendCommand(t *testing.T, conn net.Conn, cmd command) {
 func TestReplay_ReturnsStatus(t *testing.T) {
 	t.Parallel()
 
-	_, sockPath, cancel := startBackend(t, func(_ context.Context, _ backend.Message) {})
+	_, sockPath, cancel := startBackend(t, func(_ context.Context, _ backend.Message) {}, &stubModelService{})
 	defer cancel()
 
 	conn := dial(t, sockPath)
@@ -172,7 +208,7 @@ func TestSend_DeliversToHandler(t *testing.T) {
 		mu.Unlock()
 	}
 
-	_, sockPath, cancel := startBackend(t, handler)
+	_, sockPath, cancel := startBackend(t, handler, &stubModelService{})
 	defer cancel()
 
 	conn := dial(t, sockPath)
@@ -222,7 +258,7 @@ func TestSend_EmptyTextIgnored(t *testing.T) {
 		called = true
 	}
 
-	_, sockPath, cancel := startBackend(t, handler)
+	_, sockPath, cancel := startBackend(t, handler, &stubModelService{})
 	defer cancel()
 
 	conn := dial(t, sockPath)
@@ -239,10 +275,10 @@ func TestSend_EmptyTextIgnored(t *testing.T) {
 func TestSendMessage_PushesToClients(t *testing.T) {
 	t.Parallel()
 
-	b, sockPath, cancel := startBackend(t, func(_ context.Context, _ backend.Message) {})
+	b, sockPath, cancel := startBackend(t, func(_ context.Context, _ backend.Message) {}, &stubModelService{})
 	defer cancel()
 
-	conn := dial(t, sockPath)
+	conn := dialSynced(t, sockPath)
 	defer conn.Close()
 
 	// SendMessage from the backend side (simulating a bot reply).
@@ -269,10 +305,10 @@ func TestSendMessage_PushesToClients(t *testing.T) {
 func TestSendFile_PushesImageEvent(t *testing.T) {
 	t.Parallel()
 
-	b, sockPath, cancel := startBackend(t, func(_ context.Context, _ backend.Message) {})
+	b, sockPath, cancel := startBackend(t, func(_ context.Context, _ backend.Message) {}, &stubModelService{})
 	defer cancel()
 
-	conn := dial(t, sockPath)
+	conn := dialSynced(t, sockPath)
 	defer conn.Close()
 
 	err := b.SendFile(context.Background(), "local", "/tmp/chart.png")
@@ -306,7 +342,7 @@ func TestSendFile_Command(t *testing.T) {
 		mu.Unlock()
 	}
 
-	_, sockPath, cancel := startBackend(t, handler)
+	_, sockPath, cancel := startBackend(t, handler, &stubModelService{})
 	defer cancel()
 
 	conn := dial(t, sockPath)
@@ -337,10 +373,10 @@ func TestSendFile_Command(t *testing.T) {
 func TestSendDelta_StreamsToClients(t *testing.T) {
 	t.Parallel()
 
-	b, sockPath, cancel := startBackend(t, func(_ context.Context, _ backend.Message) {})
+	b, sockPath, cancel := startBackend(t, func(_ context.Context, _ backend.Message) {}, &stubModelService{})
 	defer cancel()
 
-	conn := dial(t, sockPath)
+	conn := dialSynced(t, sockPath)
 	defer conn.Close()
 
 	cs := newConnScanner(conn)
@@ -371,7 +407,7 @@ func TestSendDelta_StreamsToClients(t *testing.T) {
 func TestBackend_ImplementsStreamer(t *testing.T) {
 	t.Parallel()
 
-	b, _, cancel := startBackend(t, func(_ context.Context, _ backend.Message) {})
+	b, _, cancel := startBackend(t, func(_ context.Context, _ backend.Message) {}, &stubModelService{})
 	defer cancel()
 
 	// Verify the socket backend implements backend.Streamer.

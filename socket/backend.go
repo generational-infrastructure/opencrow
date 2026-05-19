@@ -42,6 +42,7 @@ const (
 	evAck     eventKind = "ack"
 	evImg     eventKind = "img"
 	evError   eventKind = "error"
+	evModels  eventKind = "models"
 	evConfirm eventKind = "confirm"
 )
 
@@ -62,18 +63,19 @@ const (
 //
 //nolint:tagliatelle // protocol compatibility with nostr-chatd
 type event struct {
-	Kind        eventKind `json:"kind"`
-	Msg         *message  `json:"msg,omitempty"`
-	Target      string    `json:"target,omitempty"`
-	Mark        string    `json:"mark,omitempty"`
-	Image       string    `json:"image,omitempty"`
-	State       msgState  `json:"state,omitempty"`
-	Streaming   bool      `json:"streaming"`
-	RelaysUp    int       `json:"relaysUp"`
-	RelaysTotal int       `json:"relaysTotal,omitempty"`
-	Name        string    `json:"name,omitempty"`
-	Unread      int       `json:"unread,omitempty"`
-	Text        string    `json:"text,omitempty"`
+	Kind        eventKind           `json:"kind"`
+	Msg         *message            `json:"msg,omitempty"`
+	Target      string              `json:"target,omitempty"`
+	Mark        string              `json:"mark,omitempty"`
+	Image       string              `json:"image,omitempty"`
+	State       msgState            `json:"state,omitempty"`
+	Streaming   bool                `json:"streaming"`
+	RelaysUp    int                 `json:"relaysUp"`
+	RelaysTotal int                 `json:"relaysTotal,omitempty"`
+	Name        string              `json:"name,omitempty"`
+	Unread      int                 `json:"unread,omitempty"`
+	Text        string              `json:"text,omitempty"`
+	Models      []backend.ModelInfo `json:"models,omitempty"`
 	// confirm-event fields. ConfirmID is the pi extension_ui_request id
 	// that the client must echo back via cmdConfirmResponse.
 	ConfirmID    string `json:"confirmId,omitempty"`
@@ -103,17 +105,21 @@ const (
 	cmdSendFile        cmdName = "send-file"
 	cmdReplay          cmdName = "replay"
 	cmdMarkRead        cmdName = "mark-read"
+	cmdListModels      cmdName = "list-models"
+	cmdSetModel        cmdName = "set-model"
 	cmdConfirmResponse cmdName = "confirm-response"
 )
 
 //nolint:tagliatelle // protocol compatibility with nostr-chatd
 type command struct {
-	Cmd     cmdName `json:"cmd"`
-	Text    string  `json:"text,omitempty"`
-	ReplyTo string  `json:"replyTo,omitempty"`
-	Path    string  `json:"path,omitempty"`
-	N       int     `json:"n,omitempty"`
-	Type    string  `json:"type,omitempty"`
+	Cmd      cmdName `json:"cmd"`
+	Text     string  `json:"text,omitempty"`
+	ReplyTo  string  `json:"replyTo,omitempty"`
+	Path     string  `json:"path,omitempty"`
+	N        int     `json:"n,omitempty"`
+	Type     string  `json:"type,omitempty"`
+	Provider string  `json:"provider,omitempty"`
+	ModelID  string  `json:"modelId,omitempty"` //nolint:tagliatelle // match pi protocol camelCase
 	// confirm-response fields
 	ID        string `json:"id,omitempty"`
 	Confirmed bool   `json:"confirmed,omitempty"`
@@ -123,10 +129,18 @@ type command struct {
 
 const conversationID = "local"
 
+// ModelService exposes model listing and switching. Implemented by the
+// Worker; injected so the socket package stays transport-only.
+type ModelService interface {
+	ListModels(ctx context.Context) ([]backend.ModelInfo, error)
+	SetModel(ctx context.Context, provider, modelID string) (*backend.ModelInfo, error)
+}
+
 // Backend implements backend.Backend over a local UNIX socket.
 type Backend struct {
 	cfg     Config
 	handler backend.MessageHandler
+	models  ModelService
 
 	cancel backend.Canceler
 
@@ -142,10 +156,15 @@ type Backend struct {
 	pending   map[string]chan bool
 }
 
-// New creates a new socket backend.
-func New(cfg Config, handler backend.MessageHandler) (*Backend, error) {
+// New creates a new socket backend. models is required; pass a no-op
+// implementation if the backend should never serve model commands.
+func New(cfg Config, handler backend.MessageHandler, models ModelService) (*Backend, error) {
 	if cfg.SocketPath == "" {
 		return nil, errors.New("socket path is required")
+	}
+
+	if models == nil {
+		return nil, errors.New("model service is required")
 	}
 
 	if cfg.Name == "" {
@@ -155,6 +174,7 @@ func New(cfg Config, handler backend.MessageHandler) (*Backend, error) {
 	return &Backend{
 		cfg:     cfg,
 		handler: handler,
+		models:  models,
 		conns:   make(map[net.Conn]struct{}),
 		pending: make(map[string]chan bool),
 	}, nil
@@ -293,6 +313,22 @@ func (b *Backend) MarkdownFlavor() backend.MarkdownFlavor {
 	return backend.MarkdownFull
 }
 
+// BroadcastModels fetches the current model list via the injected
+// service and pushes it to every connected client. Called by the
+// worker after a fresh pi spawn so dropdowns sync without any
+// client-side polling. Safe to call concurrently with prompt
+// processing — the underlying ListModels serializes on the worker.
+func (b *Backend) BroadcastModels(ctx context.Context) {
+	models, err := b.models.ListModels(ctx)
+	if err != nil {
+		slog.Warn("socket: broadcast models failed", "error", err)
+
+		return
+	}
+
+	b.push(event{Kind: evModels, Models: models})
+}
+
 // --- Internal ---
 
 func (b *Backend) handleConn(ctx context.Context, conn net.Conn) {
@@ -328,6 +364,9 @@ func (b *Backend) handleCommand(ctx context.Context, cmd command, conn net.Conn)
 	case cmdSendFile:
 		b.handleSendFile(ctx, cmd)
 	case cmdReplay:
+		// Always emits exactly one status event back to the caller.
+		// Tests (dialSynced) and clients rely on this to confirm the
+		// connection is registered before subsequent broadcasts.
 		b.pushTo(conn, event{
 			Kind:        evStatus,
 			Streaming:   true,
@@ -339,6 +378,10 @@ func (b *Backend) handleCommand(ctx context.Context, cmd command, conn net.Conn)
 		// No-op for local backend.
 	case cmdConfirmResponse:
 		b.handleConfirmResponse(cmd)
+	case cmdListModels:
+		b.handleListModels(ctx, conn)
+	case cmdSetModel:
+		b.handleSetModel(ctx, cmd, conn)
 	default:
 		slog.Warn("socket: unknown command", "cmd", cmd.Cmd)
 	}
@@ -501,4 +544,40 @@ func (b *Backend) pushTo(conn net.Conn, ev event) {
 
 func (b *Backend) nextID() string {
 	return "local-" + strconv.FormatInt(b.msgSeq.Add(1), 10)
+}
+
+// handleListModels responds with the model list as a 'models' event.
+// On failure the requesting client receives an error event carrying
+// the underlying message — the worker cold-spawns pi as part of
+// list-models, so reaching this error path means something is
+// genuinely broken and the UI should surface it.
+func (b *Backend) handleListModels(ctx context.Context, conn net.Conn) {
+	models, err := b.models.ListModels(ctx)
+	if err != nil {
+		slog.Warn("socket: list models failed", "error", err)
+		b.pushTo(conn, event{Kind: evError, Text: "list-models failed: " + err.Error()})
+
+		return
+	}
+
+	b.pushTo(conn, event{Kind: evModels, Models: models})
+}
+
+// handleSetModel forwards a set-model command to the model service.
+// On success the worker has switched pi to the requested model and we
+// broadcast a fresh full list to every connected client so all dropdowns
+// reconcile their active marker — a partial single-entry push would leave
+// clients that connected late (or before list-models replied) with a
+// one-entry view. On failure the requesting client receives an error
+// event. Validation (including empty args) is left to pi: either the
+// model exists and switches, or it doesn't and pi reports why.
+func (b *Backend) handleSetModel(ctx context.Context, cmd command, conn net.Conn) {
+	if _, err := b.models.SetModel(ctx, cmd.Provider, cmd.ModelID); err != nil {
+		slog.Warn("socket: set model failed", "error", err, "provider", cmd.Provider, "modelId", cmd.ModelID)
+		b.pushTo(conn, event{Kind: evError, Text: "set-model failed: " + err.Error()})
+
+		return
+	}
+
+	b.BroadcastModels(ctx)
 }
