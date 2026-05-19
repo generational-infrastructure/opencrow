@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/pinpox/opencrow/backend"
 )
 
 // rpcParsed is sent from the persistent stdout reader to the caller.
@@ -471,33 +473,36 @@ func (p *PiProcess) waitForResult(ctx context.Context, onDelta func(string)) (st
 	return w.reply, nil
 }
 
-func (p *PiProcess) waitForCompactResponse(ctx context.Context) (*CompactResult, error) {
-	var result *CompactResult
-
+// waitForResponse drains events until a response for the given command
+// arrives, unmarshals its data into dst, and returns. Context cancellation
+// is wrapped with a uniform error message. Failed responses are caught
+// by handleSideEffects before reaching the callback.
+func (p *PiProcess) waitForResponse(ctx context.Context, command string, dst any) error {
 	err := p.drainEvents(ctx, func(evt rpcEvent) (bool, error) {
-		if evt.Type != rpcTypeResponse || evt.Command != "compact" {
+		if evt.Type != rpcTypeResponse || evt.Command != command {
 			return false, nil
 		}
 
-		// Failed responses are already caught by handleSideEffects.
-		var cr CompactResult
-		if err := json.Unmarshal(evt.Data, &cr); err != nil {
-			return false, fmt.Errorf("parsing compact result: %w", err)
+		if err := json.Unmarshal(evt.Data, dst); err != nil {
+			return false, fmt.Errorf("parsing %s result: %w", command, err)
 		}
-
-		result = &cr
 
 		return true, nil
 	})
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, fmt.Errorf("context cancelled: %w", ctx.Err())
-		}
+	if err != nil && ctx.Err() != nil {
+		return fmt.Errorf("context cancelled: %w", ctx.Err())
+	}
 
+	return err
+}
+
+func (p *PiProcess) waitForCompactResponse(ctx context.Context) (*CompactResult, error) {
+	var cr CompactResult
+	if err := p.waitForResponse(ctx, "compact", &cr); err != nil {
 		return nil, err
 	}
 
-	return result, nil
+	return &cr, nil
 }
 
 // autoRespondExtensionUI handles extension_ui_request events that the
@@ -588,4 +593,99 @@ func parseAssistantContent(raw json.RawMessage) string {
 	}
 
 	return strings.Join(parts, "\n")
+}
+
+// ModelInfo is re-exported from the backend package for convenience.
+type ModelInfo = backend.ModelInfo
+
+// ListModels asks pi for the list of configured models. The currently
+// active model is marked with Active=true by also fetching get_state
+// — pi's get_available_models response on its own carries no active
+// indicator, and clients need it to render the "selected" state.
+func (p *PiProcess) ListModels(ctx context.Context) ([]ModelInfo, error) {
+	if !p.IsAlive() {
+		return nil, errors.New("pi process is not alive")
+	}
+
+	if err := p.sendCommand(map[string]string{"type": "get_available_models"}); err != nil {
+		return nil, err
+	}
+
+	var resp struct {
+		Models []ModelInfo `json:"models"`
+	}
+	if err := p.waitForResponse(ctx, "get_available_models", &resp); err != nil {
+		return nil, err
+	}
+
+	models := resp.Models
+
+	active, err := p.getActiveModel(ctx)
+	if err != nil {
+		// State lookup failed — return the list anyway so the UI can
+		// still populate the dropdown. The user just won't see which
+		// model is selected until the next set_model.
+		slog.Warn("pi: get_state failed; active model unknown", "error", err)
+
+		return models, nil
+	}
+
+	if active.Provider == "" || active.ID == "" {
+		// No model in session yet (e.g. fresh start before first prompt).
+		return models, nil
+	}
+
+	for i := range models {
+		if models[i].Provider == active.Provider && models[i].ID == active.ID {
+			models[i].Active = true
+
+			break
+		}
+	}
+
+	return models, nil
+}
+
+// getActiveModel returns the currently selected model from pi's session
+// state, or an empty ModelInfo if none is set. Used by ListModels to
+// stamp the Active flag on the matching list entry.
+func (p *PiProcess) getActiveModel(ctx context.Context) (ModelInfo, error) {
+	if err := p.sendCommand(map[string]string{"type": "get_state"}); err != nil {
+		return ModelInfo{}, err
+	}
+
+	var state struct {
+		Model *ModelInfo `json:"model"`
+	}
+	if err := p.waitForResponse(ctx, "get_state", &state); err != nil {
+		return ModelInfo{}, err
+	}
+
+	if state.Model == nil {
+		return ModelInfo{}, nil
+	}
+
+	return *state.Model, nil
+}
+
+// SetModel tells pi to switch to a different model.
+func (p *PiProcess) SetModel(ctx context.Context, provider, modelID string) (*ModelInfo, error) {
+	if !p.IsAlive() {
+		return nil, errors.New("pi process is not alive")
+	}
+
+	if err := p.sendCommand(map[string]any{
+		"type":     "set_model",
+		"provider": provider,
+		"modelId":  modelID,
+	}); err != nil {
+		return nil, err
+	}
+
+	var m ModelInfo
+	if err := p.waitForResponse(ctx, "set_model", &m); err != nil {
+		return nil, err
+	}
+
+	return &m, nil
 }

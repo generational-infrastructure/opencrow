@@ -161,3 +161,35 @@ func TestWorker_StopPiKillsProcessTree(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// TestWorker_ListModelsColdSpawnsPi covers the dropdown-on-connect case:
+// the GUI issues list-models before any chat traffic. Without cold-spawn
+// behaviour the worker would error with "no active session", leaving the
+// model picker stuck on "unknown" until the user sent a prompt.
+func TestWorker_ListModelsColdSpawnsPi(t *testing.T) {
+	t.Parallel()
+
+	w := newFakePiWorker(t)
+
+	if w.IsActive() {
+		t.Fatal("precondition: worker should be cold")
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go w.Run(ctx)
+
+	models, err := w.ListModels(ctx)
+	if err != nil {
+		t.Fatalf("ListModels on cold worker: %v", err)
+	}
+
+	if len(models) == 0 {
+		t.Fatal("cold spawn produced empty model list")
+	}
+
+	if !w.IsActive() {
+		t.Fatal("ListModels did not leave pi alive")
+	}
+}
