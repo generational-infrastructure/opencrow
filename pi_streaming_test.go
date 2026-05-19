@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -179,5 +182,69 @@ func TestWorker_StreamsDeltasToBackend(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("sendWithRetry never returned")
+	}
+}
+
+// TestRpcEvent_UnmarshalsMessageUpdateWithMessageObject pins down the
+// JSON contract between pi-mono and opencrow at the rpcEvent decode
+// site. Pi-mono's message_update events carry the running assistant
+// message as an OBJECT under the top-level "message" key, while the
+// extension_ui_request{method=confirm} event carries a prompt STRING
+// under the same key. Any rpcEvent field that types "message" as a
+// non-RawMessage would refuse to decode message_update lines (and
+// also message_start / message_end), forcing readEvents to drop the
+// event and dropping every streaming text_delta with it.
+//
+// The symptom on the wire is a chat that no longer streams: the final
+// agent_end (which uses the plural "messages" key) still parses, so a
+// single completed bubble arrives but no incremental delta events do.
+func TestRpcEvent_UnmarshalsMessageUpdateWithMessageObject(t *testing.T) {
+	t.Parallel()
+
+	line := `{"type":"message_update","message":{"role":"assistant","content":[{"type":"text","text":"Hello"}]},"assistantMessageEvent":{"type":"text_delta","delta":"Hello"}}`
+
+	var evt rpcEvent
+	if err := json.Unmarshal([]byte(line), &evt); err != nil {
+		t.Fatalf("rpcEvent must decode pi's real message_update shape, got: %v", err)
+	}
+
+	if evt.Type != rpcTypeMessageUpdate {
+		t.Errorf("Type = %q, want %q", evt.Type, rpcTypeMessageUpdate)
+	}
+	if evt.AssistantMessageEvent == nil {
+		t.Fatal("AssistantMessageEvent decoded as nil — delta lost")
+	}
+	if evt.AssistantMessageEvent.Type != "text_delta" || evt.AssistantMessageEvent.Delta != "Hello" {
+		t.Errorf("AssistantMessageEvent = %+v, want {text_delta Hello}", evt.AssistantMessageEvent)
+	}
+}
+
+// TestReadEvents_ForwardsMessageUpdateWithMessageObject pins the same
+// contract one layer up: readEvents must not silently drop the line
+// when "message" is an object. Drop here would explain the live-system
+// symptom even if rpcEvent itself decoded permissively, so we assert
+// the whole readEvents pipeline forwards the event downstream.
+func TestReadEvents_ForwardsMessageUpdateWithMessageObject(t *testing.T) {
+	t.Parallel()
+
+	line := `{"type":"message_update","message":{"role":"assistant","content":[]},"assistantMessageEvent":{"type":"text_delta","delta":"Hi"}}` + "\n"
+	scanner := bufio.NewScanner(strings.NewReader(line))
+	ch := make(chan rpcParsed, 1)
+
+	go readEvents(scanner, ch)
+
+	select {
+	case parsed, ok := <-ch:
+		if !ok {
+			t.Fatal("readEvents closed channel without forwarding message_update")
+		}
+		if parsed.err != nil {
+			t.Fatalf("readEvents: %v", parsed.err)
+		}
+		if parsed.event.AssistantMessageEvent == nil || parsed.event.AssistantMessageEvent.Delta != "Hi" {
+			t.Errorf("delta lost in readEvents: %+v", parsed.event.AssistantMessageEvent)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for forwarded message_update")
 	}
 }

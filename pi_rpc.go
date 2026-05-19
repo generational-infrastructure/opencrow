@@ -35,7 +35,17 @@ type rpcEvent struct {
 	Messages json.RawMessage `json:"messages,omitempty"`
 
 	// extension_ui_request fields
-	Method string `json:"method,omitempty"`
+	Method         string `json:"method,omitempty"`
+	Title          string `json:"title,omitempty"`
+	// ConfirmMessage is the prompt body of an extension_ui_request{method=confirm}.
+	// Decoded as RawMessage because the same "message" JSON key is reused by
+	// message_update/message_start/message_end events to carry an OBJECT
+	// (the running assistant message). Decoding that object into a string
+	// would fail and force readEvents to drop the entire event, killing
+	// streaming. Pi-mono only sets "message" to a string for confirm, so
+	// we unmarshal it lazily in autoRespondExtensionUI.
+	ConfirmMessage json.RawMessage `json:"message,omitempty"`
+	TimeoutMs      int    `json:"timeout,omitempty"`
 
 	// tool_execution_start fields — camelCase is dictated by the pi protocol.
 	ToolName string         `json:"toolName,omitempty"` //nolint:tagliatelle // pi protocol uses camelCase
@@ -134,6 +144,9 @@ func (p *PiProcess) sendAndWait(ctx context.Context, message string, onDelta fun
 	return p.waitForResult(ctx, onDelta)
 }
 
+// sendCommand writes a single NDJSON command frame to pi's stdin.
+// Safe to call from multiple goroutines (extension UI handlers run
+// out-of-band from the worker that drives prompts).
 func (p *PiProcess) sendCommand(cmd any) error {
 	data, err := json.Marshal(cmd)
 	if err != nil {
@@ -142,11 +155,29 @@ func (p *PiProcess) sendCommand(cmd any) error {
 
 	data = append(data, '\n')
 
+	p.stdinMu.Lock()
+	defer p.stdinMu.Unlock()
+
 	if _, err := p.stdin.Write(data); err != nil {
 		return fmt.Errorf("writing to pi stdin: %w", err)
 	}
 
 	return nil
+}
+
+// SendExtensionUIResponse releases a pending extension_ui_request.
+// confirmed is ignored when cancelled is true.
+func (p *PiProcess) SendExtensionUIResponse(id string, confirmed, cancelled bool) error {
+	cmd := map[string]any{
+		"type": "extension_ui_response",
+		"id":   id,
+	}
+	if cancelled {
+		cmd["cancelled"] = true
+	} else {
+		cmd["confirmed"] = confirmed
+	}
+	return p.sendCommand(cmd)
 }
 
 func (p *PiProcess) sendPromptCommand(message string) error {
@@ -469,14 +500,28 @@ func (p *PiProcess) waitForCompactResponse(ctx context.Context) (*CompactResult,
 	return result, nil
 }
 
+// autoRespondExtensionUI handles extension_ui_request events that the
+// backend cannot answer interactively. confirm requests are forwarded
+// to p.onConfirm when set; the handler is responsible for eventually
+// calling SendExtensionUIResponse. All other interactive methods are
+// auto-cancelled so the extension doesn't deadlock.
 func (p *PiProcess) autoRespondExtensionUI(evt rpcEvent) {
+	if evt.Method == "confirm" && p.onConfirm != nil {
+		// ConfirmMessage is RawMessage to coexist with the object-typed
+		// "message" key on message_update events; decode lazily here.
+		// A non-string value (would never happen for method=confirm, but
+		// guard anyway) yields an empty prompt body rather than dropping
+		// the confirm.
+		var body string
+		if len(evt.ConfirmMessage) > 0 {
+			_ = json.Unmarshal(evt.ConfirmMessage, &body)
+		}
+		go p.onConfirm(evt.ID, evt.Title, body, evt.TimeoutMs)
+		return
+	}
 	switch evt.Method {
 	case "select", "confirm", "input", "editor":
-		if err := p.sendCommand(map[string]any{
-			"type":      "extension_ui_response",
-			"id":        evt.ID,
-			"cancelled": true,
-		}); err != nil {
+		if err := p.SendExtensionUIResponse(evt.ID, false, true); err != nil {
 			slog.Warn("failed to send extension_ui_response", "error", err)
 		}
 	}

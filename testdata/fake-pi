@@ -20,10 +20,20 @@ while IFS= read -r line; do
       # When the prompt asks for it, emit a sequence of text_delta
       # message_update events so streaming tests can assert each piece
       # reaches the backend before the agent_end commits the full reply.
+      # Each event mirrors pi-mono's real shape: a top-level "message"
+      # OBJECT carrying the running assistant message alongside the
+      # incremental "assistantMessageEvent". Tests use this to pin the
+      # rpcEvent decode contract — a regression that types "message" as
+      # a non-RawMessage refuses to decode the line and drops the delta.
       case "$line" in
         *stream-deltas*)
-          for piece in '"Hello"' '", "' '"world"' '"!"'; do
-            printf '%s\n' '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":'"$piece"'}}'
+          # Two parallel arrays: delta is the incremental fragment,
+          # partial is the cumulative text after that fragment is
+          # appended (matches what pi-mono carries in "message.content").
+          deltas=('"Hello"' '", "' '"world"' '"!"')
+          partials=('"Hello"' '"Hello, "' '"Hello, world"' '"Hello, world!"')
+          for i in 0 1 2 3; do
+            printf '%s\n' '{"type":"message_update","message":{"role":"assistant","content":[{"type":"text","text":'"${partials[$i]}"'}]},"assistantMessageEvent":{"type":"text_delta","delta":'"${deltas[$i]}"'}}'
           done
           printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"Hello, world!"}],"stopReason":"end_turn"}]}'
           ;;
