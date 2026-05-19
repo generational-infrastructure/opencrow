@@ -193,3 +193,36 @@ func TestWorker_ListModelsColdSpawnsPi(t *testing.T) {
 		t.Fatal("ListModels did not leave pi alive")
 	}
 }
+
+// Regression: clicking the panel's "reset" button (sends !restart) used
+// to drop the user's previously-selected model because processSetModel
+// only updated the running pi via RPC — it didn't touch w.piCfg, so the
+// next ensurePi(fresh=true) spawn rebuilt args from the configured
+// default. Persist the selection on the worker so restarts respect it.
+func TestWorker_SetModelPersistsAcrossRestart(t *testing.T) {
+	t.Parallel()
+
+	w := newFakePiWorker(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go w.Run(ctx)
+
+	model, err := w.SetModel(ctx, "local", "gpt-oss")
+	if err != nil {
+		t.Fatalf("SetModel: %v", err)
+	}
+	if model == nil || model.Provider != "local" || model.ID != "gpt-oss" {
+		t.Fatalf("SetModel returned %+v, want provider=local id=gpt-oss", model)
+	}
+
+	w.mu.Lock()
+	gotProvider, gotModel := w.piCfg.Provider, w.piCfg.Model
+	w.mu.Unlock()
+
+	if gotProvider != "local" || gotModel != "gpt-oss" {
+		t.Fatalf("piCfg after SetModel = (%q, %q), want (local, gpt-oss); "+
+			"selection is lost on the next restart", gotProvider, gotModel)
+	}
+}

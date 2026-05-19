@@ -644,6 +644,15 @@ func (w *Worker) processSetModel(ctx context.Context, provider, modelID string) 
 	}
 
 	model, err := pi.SetModel(ctx, provider, modelID)
+	if err == nil && model != nil {
+		// Persist the user's choice on the worker so the next
+		// spawn (after !restart, idle timeout, or a crash) starts
+		// with this model instead of the configured default.
+		w.mu.Lock()
+		w.piCfg.Provider = model.Provider
+		w.piCfg.Model = model.ID
+		w.mu.Unlock()
+	}
 	ch <- setModelOutcome{model: model, err: err}
 }
 
