@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -36,9 +37,15 @@ type ToolCallEvent struct {
 type PiProcess struct {
 	cmd        *exec.Cmd
 	stdin      io.WriteCloser
+	stdinMu    sync.Mutex
 	done       chan struct{}
 	events     <-chan rpcParsed    // single persistent reader feeds all waiters
 	onToolCall func(ToolCallEvent) // optional callback for tool_execution_start events
+	// onConfirm, if set, handles extension_ui_request method=confirm events
+	// instead of the default auto-cancel. The handler must call
+	// SendExtensionUIResponse to release the pi-side waiter.
+	// Invoked in a fresh goroutine so the stdout reader keeps draining.
+	onConfirm func(id, title, message string, timeoutMs int)
 }
 
 // StartPi spawns a pi --mode rpc subprocess for the given room.

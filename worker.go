@@ -86,6 +86,13 @@ func (w *Worker) SetApp(app *App) { w.app = app }
 // SetBackend wires the backend reference (phase 2 of init).
 func (w *Worker) SetBackend(be Backend) { w.be = be }
 
+// confirmRequester is an optional backend capability used to forward
+// pi extension_ui_request confirm prompts to the user. Backends that
+// don't implement it leave the default auto-cancel in place.
+type confirmRequester interface {
+	RequestConfirm(ctx context.Context, id, title, message string, timeoutMs int) (bool, error)
+}
+
 // Notify wakes the worker loop. Called after enqueueing an item.
 // If the new item has strictly higher priority than the running one,
 // the running operation is preempted.
@@ -557,6 +564,28 @@ func (w *Worker) ensurePi(ctx context.Context) (*PiProcess, error) {
 		flavor := w.be.MarkdownFlavor()
 		pi.onToolCall = func(evt ToolCallEvent) { //nolint:contextcheck // fire-and-forget notification, no parent ctx
 			w.be.SendMessage(context.Background(), w.resolveRoomID(), formatToolCall(evt, flavor), "")
+		}
+	}
+
+	if cr, ok := w.be.(confirmRequester); ok {
+		pi.onConfirm = func(id, title, message string, timeoutMs int) {
+			ctx := context.Background()
+			if timeoutMs > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
+				defer cancel()
+			}
+			ok, err := cr.RequestConfirm(ctx, id, title, message, timeoutMs)
+			if err != nil {
+				slog.Warn("worker: confirm forward failed, cancelling", "error", err, "id", id)
+				if rerr := pi.SendExtensionUIResponse(id, false, true); rerr != nil {
+					slog.Warn("worker: failed to cancel confirm", "error", rerr)
+				}
+				return
+			}
+			if rerr := pi.SendExtensionUIResponse(id, ok, false); rerr != nil {
+				slog.Warn("worker: failed to send confirm response", "error", rerr)
+			}
 		}
 	}
 

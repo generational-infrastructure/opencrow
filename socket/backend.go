@@ -36,12 +36,13 @@ type Config struct {
 type eventKind string
 
 const (
-	evStatus eventKind = "status"
-	evMsg    eventKind = "msg"
-	evSent   eventKind = "sent"
-	evAck    eventKind = "ack"
-	evImg    eventKind = "img"
-	evError  eventKind = "error"
+	evStatus  eventKind = "status"
+	evMsg     eventKind = "msg"
+	evSent    eventKind = "sent"
+	evAck     eventKind = "ack"
+	evImg     eventKind = "img"
+	evError   eventKind = "error"
+	evConfirm eventKind = "confirm"
 )
 
 type dir string
@@ -73,6 +74,11 @@ type event struct {
 	Name        string    `json:"name,omitempty"`
 	Unread      int       `json:"unread,omitempty"`
 	Text        string    `json:"text,omitempty"`
+	// confirm-event fields. ConfirmID is the pi extension_ui_request id
+	// that the client must echo back via cmdConfirmResponse.
+	ConfirmID    string `json:"confirmId,omitempty"`
+	ConfirmTitle string `json:"confirmTitle,omitempty"`
+	ConfirmBody  string `json:"confirmBody,omitempty"`
 }
 
 //nolint:tagliatelle // protocol compatibility with nostr-chatd
@@ -93,10 +99,11 @@ type message struct {
 type cmdName string
 
 const (
-	cmdSend     cmdName = "send"
-	cmdSendFile cmdName = "send-file"
-	cmdReplay   cmdName = "replay"
-	cmdMarkRead cmdName = "mark-read"
+	cmdSend            cmdName = "send"
+	cmdSendFile        cmdName = "send-file"
+	cmdReplay          cmdName = "replay"
+	cmdMarkRead        cmdName = "mark-read"
+	cmdConfirmResponse cmdName = "confirm-response"
 )
 
 //nolint:tagliatelle // protocol compatibility with nostr-chatd
@@ -107,6 +114,9 @@ type command struct {
 	Path    string  `json:"path,omitempty"`
 	N       int     `json:"n,omitempty"`
 	Type    string  `json:"type,omitempty"`
+	// confirm-response fields
+	ID        string `json:"id,omitempty"`
+	Confirmed bool   `json:"confirmed,omitempty"`
 }
 
 // --- Backend implementation ---
@@ -124,6 +134,12 @@ type Backend struct {
 	conns map[net.Conn]struct{}
 
 	msgSeq atomic.Int64
+
+	// pending tracks in-flight RequestConfirm calls keyed by request id.
+	// The handler for cmdConfirmResponse looks up the channel and
+	// delivers the user's decision (or closes on cancel).
+	pendingMu sync.Mutex
+	pending   map[string]chan bool
 }
 
 // New creates a new socket backend.
@@ -140,6 +156,7 @@ func New(cfg Config, handler backend.MessageHandler) (*Backend, error) {
 		cfg:     cfg,
 		handler: handler,
 		conns:   make(map[net.Conn]struct{}),
+		pending: make(map[string]chan bool),
 	}, nil
 }
 
@@ -320,8 +337,72 @@ func (b *Backend) handleCommand(ctx context.Context, cmd command, conn net.Conn)
 		})
 	case cmdMarkRead:
 		// No-op for local backend.
+	case cmdConfirmResponse:
+		b.handleConfirmResponse(cmd)
 	default:
 		slog.Warn("socket: unknown command", "cmd", cmd.Cmd)
+	}
+}
+
+// handleConfirmResponse resolves the pending RequestConfirm call
+// matching cmd.ID. Drops on unknown id (stale response after timeout).
+func (b *Backend) handleConfirmResponse(cmd command) {
+	if cmd.ID == "" {
+		return
+	}
+	b.pendingMu.Lock()
+	ch, ok := b.pending[cmd.ID]
+	if ok {
+		delete(b.pending, cmd.ID)
+	}
+	b.pendingMu.Unlock()
+	if !ok {
+		slog.Debug("socket: confirm-response for unknown id", "id", cmd.ID)
+		return
+	}
+	// Non-blocking — RequestConfirm always has a receiver waiting on a
+	// buffered channel, but guard anyway.
+	select {
+	case ch <- cmd.Confirmed:
+	default:
+	}
+}
+
+// RequestConfirm pushes a confirm event to every connected client and
+// blocks until one of them answers via cmdConfirmResponse, the context
+// is cancelled, or all clients have disconnected with no answer.
+//
+// Returns the user's decision (true = allow). On context cancellation
+// or "no clients available" returns false with the corresponding error
+// so the caller can decide whether to treat that as deny vs cancel.
+func (b *Backend) RequestConfirm(ctx context.Context, id, title, message string, _timeoutMs int) (bool, error) {
+	if id == "" {
+		return false, errors.New("confirm id required")
+	}
+
+	ch := make(chan bool, 1)
+	b.pendingMu.Lock()
+	b.pending[id] = ch
+	b.pendingMu.Unlock()
+
+	defer func() {
+		b.pendingMu.Lock()
+		delete(b.pending, id)
+		b.pendingMu.Unlock()
+	}()
+
+	b.push(event{
+		Kind:         evConfirm,
+		ConfirmID:    id,
+		ConfirmTitle: title,
+		ConfirmBody:  message,
+	})
+
+	select {
+	case ok := <-ch:
+		return ok, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
 	}
 }
 
