@@ -400,6 +400,27 @@ func TestApp_ModelCommand(t *testing.T) {
 	}
 }
 
+// TestApp_ModelCommand_NoArgShowsCurrent asserts that `!model` with no
+// arguments reports the currently active model rather than printing a
+// usage hint. Regression: handleModel short-circuits an empty arg into
+// "Usage: ...", but bare `!model` should mirror `git branch` — show the
+// current selection so the user can decide whether to switch.
+func TestApp_ModelCommand_NoArgShowsCurrent(t *testing.T) {
+	t.Parallel()
+
+	app, mb := newFakePiApp(t)
+	sendCommand(app, "!model")
+
+	msg := waitForReply(t, mb)
+
+	if strings.Contains(msg.text, "Usage:") {
+		t.Errorf("bare !model still prints usage hint: %q", msg.text)
+	}
+	if !strings.Contains(msg.text, "local/qwen3") {
+		t.Errorf("bare !model reply %q does not name the active model local/qwen3", msg.text)
+	}
+}
+
 // waitForReply blocks until mockBackend has received at least one
 // SendMessage and returns it. Model commands go through the inbox so
 // the reply lands asynchronously after worker.Run dispatches.
