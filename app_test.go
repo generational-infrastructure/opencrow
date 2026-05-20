@@ -375,7 +375,7 @@ func TestApp_ModelCommand(t *testing.T) {
 		// through pi (success path). False cases reject in-process.
 		hitsWorker bool
 	}{
-		{"no arg", "!model", "Usage: !model", false},
+		{"no arg", "!model", "Current model: local/qwen3", false},
 		{"missing slash", "!model qwen3", "Invalid model spec", false},
 		{"empty provider", "!model /qwen3", "Invalid model spec", false},
 		{"empty id", "!model local/", "Invalid model spec", false},

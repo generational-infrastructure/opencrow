@@ -181,8 +181,24 @@ func (a *App) handleModels(ctx context.Context, msg backend.Message) {
 // is registered under multiple providers.
 func (a *App) handleModel(ctx context.Context, msg backend.Message, arg string) {
 	if arg == "" {
+		models, err := a.worker.ListModels(ctx)
+		if err != nil {
+			a.backend.SendMessage(ctx, msg.ConversationID, fmt.Sprintf("Failed to get current model: %v", err), "")
+
+			return
+		}
+
+		for _, m := range models {
+			if m.Active {
+				a.backend.SendMessage(ctx, msg.ConversationID,
+					fmt.Sprintf("Current model: %s/%s. Use !model <provider>/<id> to switch; !models lists all.", m.Provider, m.ID), "")
+
+				return
+			}
+		}
+
 		a.backend.SendMessage(ctx, msg.ConversationID,
-			"Usage: !model <provider>/<id>. Use !models to list available models.", "")
+			"No active model. Use !models to list configured models, then !model <provider>/<id> to switch.", "")
 
 		return
 	}
